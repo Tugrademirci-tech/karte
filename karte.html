@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Notfall-Navi</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+:root{--bg:#fff;--fg:#111;--card:#f2f2f4;--acc:#0a7cff}
+@media(prefers-color-scheme:dark){:root{--bg:#1b1b1f;--fg:#f2f2f2;--card:#2a2a30}}
+*{box-sizing:border-box}html,body{height:100%;margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+#map{position:absolute;inset:0}
+.top{position:absolute;z-index:1000;top:env(safe-area-inset-top,0);left:0;right:0;padding:8px}
+.box{background:var(--card);border-radius:12px;padding:8px;box-shadow:0 2px 8px #0004}
+.row{display:flex;gap:6px}
+input{flex:1;padding:10px;border-radius:8px;border:1px solid #8885;background:var(--bg);color:var(--fg);font-size:16px}
+button{padding:10px 12px;border:0;border-radius:8px;background:var(--acc);color:#fff;font-size:15px}
+button.m{background:var(--bg);color:var(--fg);border:1px solid #8885}button.m.on{background:var(--acc);color:#fff}
+#res div{padding:10px 4px;border-top:1px solid #8883;font-size:14px}
+#banner{display:none;background:#0a7cff;color:#fff;border-radius:12px;padding:10px;margin-top:6px;align-items:center;gap:12px}
+#arrow{font-size:44px;line-height:1}#bd{font-size:24px;font-weight:700}#bt{font-size:15px}
+.bot{position:absolute;z-index:1000;bottom:0;left:0;right:0;padding:8px 8px calc(8px + env(safe-area-inset-bottom,0))}
+#info{font-size:14px;margin-bottom:6px}
+</style></head><body>
+<div id="map"></div>
+<div class="top">
+ <div class="box">
+  <div class="row"><input id="q" placeholder="Adresse oder Ort suchen…"><button id="go">Suchen</button></div>
+  <div class="row" style="margin-top:6px">
+   <button class="m on" data-p="car">🚗 Auto</button><button class="m" data-p="bike">🚴 Rad</button><button class="m" data-p="foot">🚶 zu Fuß</button>
+  </div>
+  <div id="res"></div>
+ </div>
+ <div id="banner"><div id="arrow">↑</div><div><div id="bd"></div><div id="bt"></div></div></div>
+</div>
+<div class="bot"><div class="box">
+ <div id="info">Tipp: Ziel suchen – oder Karte lange gedrückt halten, um ein Ziel zu setzen.</div>
+ <div class="row">
+  <button id="nav" style="flex:1" disabled>▶ Navigation starten</button>
+  <button id="last" class="m">Letzte Route</button>
+  <button id="dl" class="m">⬇ Gebiet</button>
+ </div>
+ <div id="st" style="font-size:12px;margin-top:6px;opacity:.7"></div>
+</div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const $=id=>document.getElementById(id), LS={get:(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}},set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
+let prof='car',pos=null,dest=null,route=null,navOn=false,k=0,flags={},off=0,posM,destM,line,manM;
+const map=L.map('map',{zoomControl:false}).setView(LS.get('view',[51.1,10.4]),LS.get('zoom',6));
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
+map.on('moveend',()=>{LS.set('view',[map.getCenter().lat,map.getCenter().lng]);LS.set('zoom',map.getZoom())});
+
+// Service Worker (Offline + automatische Aktualisierung)
+if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+const status=()=>{$('st').textContent=navigator.onLine?'🟢 Online – Karte & App werden aktualisiert':'🟠 Offline – gespeicherte Karte & Route'};
+addEventListener('online',status);addEventListener('offline',status);status();
+
+// Hilfsfunktionen
+const R=6371000,rad=x=>x*Math.PI/180;
+function dist(a,b){const dLa=rad(b[0]-a[0]),dLo=rad(b[1]-a[1]);const h=Math.sin(dLa/2)**2+Math.cos(rad(a[0]))*Math.cos(rad(b[0]))*Math.sin(dLo/2)**2;return 2*R*Math.asin(Math.sqrt(h))}
+const fmt=m=>m<1000?(m<200?Math.round(m/10)*10:Math.round(m/50)*50)+' m':(m/1000).toFixed(1).replace('.',',')+' km';
+const M={left:'links','slight left':'leicht links','sharp left':'scharf links',right:'rechts','slight right':'leicht rechts','sharp right':'scharf rechts',straight:'geradeaus',uturn:'wenden'};
+const A={left:'←','slight left':'↖','sharp left':'↙',right:'→','slight right':'↗','sharp right':'↘',straight:'↑',uturn:'↶'};
+function txt(s){const m=s.maneuver,t=m.type,d=M[m.modifier]||'';let r;
+ if(t==='arrive')return'Ziel erreicht';
+ if(t==='depart')r='Losfahren';
+ else if(/roundabout|rotary/.test(t))r='Im Kreisverkehr '+(m.exit?m.exit+'. Ausfahrt nehmen':'abbiegen');
+ else if(m.modifier==='uturn')r='Wenden';
+ else if(!d||m.modifier==='straight')r='Geradeaus weiter';
+ else r=(t==='fork'?'Links/rechts halten: ':'')+d.charAt(0).toUpperCase()+d.slice(1)+' abbiegen';
+ return r+(s.name?' auf '+s.name:'')}
+const arrow=s=>/roundabout|rotary/.test(s.maneuver.type)?'⟳':s.maneuver.type==='arrive'?'⚑':A[s.maneuver.modifier]||'↑';
+function say(t){try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang='de-DE';speechSynthesis.speak(u)}catch(e){}}
+
+// Modus
+document.querySelectorAll('.m[data-p]').forEach(b=>b.onclick=()=>{prof=b.dataset.p;document.querySelectorAll('.m[data-p]').forEach(x=>x.classList.toggle('on',x===b));if(dest)calc()});
+
+// Suche (online: Nominatim, offline: gespeicherte Orte)
+async function search(){const q=$('q').value.trim();if(!q)return;let list=[];
+ if(navigator.onLine){try{const r=await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=6&accept-language=de&q='+encodeURIComponent(q));list=(await r.json()).map(x=>({n:x.display_name,lat:+x.lat,lon:+x.lon}));
+  const saved=LS.get('places',[]);list.forEach(p=>{if(!saved.some(s=>s.n===p.n))saved.push(p)});LS.set('places',saved.slice(-300))}catch(e){}}
+ if(!list.length)list=LS.get('places',[]).filter(p=>p.n.toLowerCase().includes(q.toLowerCase())).slice(0,6);
+ const res=$('res');res.innerHTML='';if(!list.length)res.innerHTML='<div>Nichts gefunden'+(navigator.onLine?'':' (offline: nur zuvor gesuchte Orte)')+'</div>';
+ list.forEach(p=>{const d=document.createElement('div');d.textContent=p.n;d.onclick=()=>{res.innerHTML='';setDest([p.lat,p.lon],p.n)};res.appendChild(d)})}
+$('go').onclick=search;$('q').onkeydown=e=>{if(e.key==='Enter')search()};
+map.on('contextmenu',e=>setDest([e.latlng.lat,e.latlng.lng],'Gewählter Punkt'));
+function setDest(ll,name){dest={ll,name};if(destM)destM.remove();destM=L.marker(ll).addTo(map);map.setView(ll,15);calc()}
+
+// Position
+function onPos(p){pos=[p.coords.latitude,p.coords.longitude];if(!posM)posM=L.circleMarker(pos,{radius:9,color:'#fff',weight:3,fillColor:'#0a7cff',fillOpacity:1}).addTo(map);else posM.setLatLng(pos);if(navOn)tick()}
+if('geolocation'in navigator)navigator.geolocation.watchPosition(onPos,()=>{$('info').textContent='Standort nicht verfügbar – bitte GPS/Standortfreigabe aktivieren.'},{enableHighAccuracy:true,maximumAge:2000});
+
+// Route berechnen (braucht Internet) – danach wird sie gespeichert
+async function calc(){if(!dest)return;
+ if(!pos){$('info').textContent='Warte auf GPS-Position…';return}
+ if(!navigator.onLine){$('info').textContent='Offline: Neue Routen brauchen Internet. „Letzte Route“ laden?';return}
+ $('info').textContent='Route wird berechnet…';
+ try{const [a,b]=[pos,dest.ll];const u=`https://routing.openstreetmap.de/routed-${prof}/route/v1/driving/${a[1]},${a[0]};${b[1]},${b[0]}?overview=full&geometries=geojson&steps=true`;
+  const j=await(await fetch(u)).json();if(!j.routes||!j.routes[0])throw 0;const r=j.routes[0];
+  route={coords:r.geometry.coordinates.map(c=>[c[1],c[0]]),steps:r.legs[0].steps,dist:r.distance,dur:r.duration,dest,prof};
+  LS.set('route',route);show(true);prefetch(route.coords)}catch(e){$('info').textContent='Route konnte nicht berechnet werden.'}}
+function show(fit){if(line)line.remove();line=L.polyline(route.coords,{color:'#0a7cff',weight:6,opacity:.85}).addTo(map);if(fit)map.fitBounds(line.getBounds(),{padding:[80,80]});
+ if(route.dest&&!destM)destM=L.marker(route.dest.ll).addTo(map);k=0;flags={};$('nav').disabled=false;
+ $('info').textContent=`${route.dest.name.split(',')[0]} · ${fmt(route.dist)} · ca. ${Math.round(route.dur/60)} Min.`}
+$('last').onclick=()=>{const r=LS.get('route');if(!r){$('info').textContent='Keine gespeicherte Route.';return}route=r;dest=r.dest;prof=r.prof;show(true)};
+
+// Navigation
+$('nav').onclick=()=>{if(navOn){navOn=false;$('nav').textContent='▶ Navigation starten';$('banner').style.display='none';if(manM)manM.remove();return}
+ navOn=true;k=0;flags={};off=0;$('nav').textContent='■ Beenden';$('banner').style.display='flex';if(pos)map.setView(pos,17);tick()};
+function tick(){if(!route||!pos)return;const st=route.steps;
+ while(k+1<st.length-1&&(dist(pos,st[k+1].maneuver.location.slice().reverse())<25||dist(pos,st[k+2].maneuver.location.slice().reverse())<dist(pos,st[k+1].maneuver.location.slice().reverse())&&dist(pos,st[k+2].maneuver.location.slice().reverse())<60)){k++;flags={}}
+ const s=st[Math.min(k+1,st.length-1)],ll=s.maneuver.location.slice().reverse(),d=dist(pos,ll);
+ if(s.maneuver.type==='arrive'&&d<25){$('bd').textContent='Ziel erreicht';$('bt').textContent='';$('arrow').textContent='⚑';say('Sie haben Ihr Ziel erreicht');return}
+ $('arrow').textContent=arrow(s);$('bd').textContent=d<30?'Jetzt':'In '+fmt(d);$('bt').textContent=txt(s);
+ if(manM)manM.setLatLng(ll);else manM=L.circleMarker(ll,{radius:12,color:'#fff',weight:3,fillColor:'#ff3b30',fillOpacity:1}).addTo(map);
+ if(d<=250&&!flags.a){flags.a=1;say('In '+fmt(d)+' '+txt(s))}if(d<=40&&!flags.b){flags.b=1;say(txt(s))}
+ const md=Math.min(...route.coords.map(c=>dist(pos,c)));off=md>60?off+1:0;
+ if(off>=3){if(navigator.onLine){off=0;say('Neu berechnen');calc()}else $('bt').textContent='⚠ Abseits der Route (offline)'}
+ map.panTo(pos)}
+
+// Kartenkacheln vorladen (werden vom Service Worker gespeichert)
+const tl=(la,lo,z)=>[Math.floor((lo+180)/360*2**z),Math.floor((1-Math.log(Math.tan(rad(la))+1/Math.cos(rad(la)))/Math.PI)/2*2**z)];
+async function prefetch(pts,zs=[13,15],cap=450){const set=new Set();let last=null;
+ for(const p of pts){if(last&&dist(last,p)<300)continue;last=p;for(const z of zs){const [x,y]=tl(p[0],p[1],z);for(let i=-1;i<=1;i++)for(let j=-1;j<=1;j++)set.add(`${z}/${x+i}/${y+j}`)}if(set.size>cap)break}
+ const urls=[...set].slice(0,cap);let n=0;
+ for(let i=0;i<urls.length;i+=6){await Promise.all(urls.slice(i,i+6).map(t=>fetch(`https://tile.openstreetmap.org/${t}.png`,{mode:'no-cors'}).catch(()=>{})));n+=6;$('st').textContent=`⬇ Karte wird gespeichert… ${Math.min(n,urls.length)}/${urls.length}`}status()}
+$('dl').onclick=()=>{if(!navigator.onLine){$('st').textContent='Zum Herunterladen Internet nötig.';return}const b=map.getBounds(),z=map.getZoom(),pts=[];const st=Math.max((b.getNorth()-b.getSouth())/8,.0005);
+ for(let la=b.getSouth();la<=b.getNorth();la+=st)for(let lo=b.getWest();lo<=b.getEast();lo+=st)pts.push([la,lo]);
+ prefetch(pts,[Math.min(z,15),Math.min(z+1,16)],400)};
+</script></body></html>
